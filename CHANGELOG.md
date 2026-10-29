@@ -1,5 +1,30 @@
 # codex-action Changelog
 
+## [v1.13](https://github.com/openai/codex-action/tree/v1.13) (2026-10-05)
+
+- [#183](https://github.com/openai/codex-action/pull/183) preserve system service access when restricting runner sockets under Linux `drop-sudo`.
+- Bound output draining to five seconds after Codex exits so descendants retaining log streams cannot keep the action open.
+- Linux `drop-sudo` now requires `setfacl` (the `acl` package) and ACL support on `/run`.
+
+## [v1.12](https://github.com/openai/codex-action/tree/v1.12) (2026-08-20)
+
+- Strengthen Linux runner privilege isolation and Responses API proxy credential handling.
+- Reject Codex arguments and configuration overrides that conflict with protected execution settings.
+- Require unprivileged user namespaces for Linux `drop-sudo`; run the action after steps that need `sudo`, Docker, or privileged service sockets.
+- Document runner requirements, permission-profile behavior, and trusted configuration boundaries.
+
+## [v1.11](https://github.com/openai/codex-action/tree/v1.11) (2026-07-04)
+
+- [#116](https://github.com/openai/codex-action/pull/116) keep the permission profile helper backward compatible
+
+## [v1.10](https://github.com/openai/codex-action/tree/v1.10) (2026-07-02)
+
+- [#113](https://github.com/openai/codex-action/pull/113) add Codex permission profile support
+
+## [v1.9](https://github.com/openai/codex-action/tree/v1.9) (2026-06-22)
+
+- [#85](https://github.com/openai/codex-action/pull/85) update the internal `setup-node` pin to `v6.3.0`
+
 ## [v1.8](https://github.com/openai/codex-action/tree/v1.8) (2026-04-29)
 
 - [#91](https://github.com/openai/codex-action/pull/91) tighten what bots are allowed

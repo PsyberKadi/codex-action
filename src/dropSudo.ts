@@ -1,10 +1,17 @@
 import { spawn } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { constants as fsConstants, promises as fs } from "node:fs";
 import * as path from "node:path";
+import {
+  captureLinuxRunnerCredentials,
+  includeAccountGroups,
+  LinuxRunnerCredentials,
+  parseLinuxRunnerCredentials,
+} from "./linuxCredentials";
 
 interface ExecOptions {
   capture?: boolean;
   ignoreFailure?: boolean;
+  inheritedFileDescriptor?: number;
 }
 
 interface ExecResult {
@@ -17,10 +24,30 @@ export interface DropSudoOptions {
   user: string;
   group: string;
   rootPhase: boolean;
+  runnerCredentials?: string;
 }
 
 const LINUX_PLATFORM = "linux";
 const MACOS_PLATFORM = "darwin";
+const LINUX_RUNTIME_DIRECTORY = "/run";
+const LINUX_O_PATH = 0o10000000;
+
+interface LinuxGroup {
+  id: number;
+  name: string;
+  primary: boolean;
+}
+
+interface RootServiceSocket {
+  path: string;
+  groupId: number;
+  device: number;
+  inode: number;
+}
+
+interface LinuxSocketCredentials extends LinuxRunnerCredentials {
+  fallbackGroupId?: number;
+}
 
 export async function dropSudo(options: DropSudoOptions): Promise<void> {
   const platform = process.platform;
@@ -35,6 +62,11 @@ export async function dropSudo(options: DropSudoOptions): Promise<void> {
     await dropSudoWithPrivileges(options);
     return;
   }
+
+  const runnerCredentials =
+    platform === LINUX_PLATFORM
+      ? JSON.stringify(captureLinuxRunnerCredentials())
+      : undefined;
 
   await ensurePasswordlessSudo();
   // `sudo -K` invalidates cached credentials but exits non-zero when no ticket
@@ -56,11 +88,18 @@ export async function dropSudo(options: DropSudoOptions): Promise<void> {
     options.user,
     "--group",
     options.group,
+    ...(runnerCredentials === undefined
+      ? []
+      : ["--runner-credentials", runnerCredentials]),
   ]);
 
   // Invalidate the sudo ticket again; ignore failures for the same reason as
   // above (some environments return an error when no timestamp exists).
   await execCommand("sudo", ["-K"], { ignoreFailure: true });
+
+  if (platform === LINUX_PLATFORM) {
+    await verifyPrivilegedSocketsRestricted();
+  }
 }
 
 async function dropSudoWithPrivileges(options: DropSudoOptions): Promise<void> {
@@ -68,29 +107,69 @@ async function dropSudoWithPrivileges(options: DropSudoOptions): Promise<void> {
     throw new Error("drop-sudo root phase must run as root.");
   }
 
+  process.env.PATH = "/usr/sbin:/usr/bin:/sbin:/bin";
+
   let changed = false;
+  let linuxSocketCredentials: LinuxSocketCredentials | undefined;
 
   switch (process.platform) {
     case LINUX_PLATFORM: {
-      if (await isUserInGroup(options.user, options.group)) {
-        if (await commandExists("deluser")) {
-          await execCommand("deluser", [options.user, options.group]);
-          console.log(
-            `Used 'deluser ${options.user} ${options.group}' to drop sudo privilege.`
-          );
-        } else if (await commandExists("gpasswd")) {
-          await execCommand("gpasswd", ["-d", options.user, options.group]);
-          console.log(
-            `Used 'gpasswd -d ${options.user} ${options.group}' to drop sudo privilege.`
-          );
-        } else {
-          throw new Error("Neither deluser nor gpasswd available.");
-        }
-        changed = true;
-      } else {
-        console.log(
-          `${options.user} is not a member of the ${options.group} group.`
+      if (options.runnerCredentials === undefined) {
+        throw new Error(
+          "Linux drop-sudo requires the original runner credentials."
         );
+      }
+      const originalCredentials = parseLinuxRunnerCredentials(
+        options.runnerCredentials
+      );
+      const userGroups = await getLinuxGroups(options.user);
+      const userId = await execCommand("id", ["-u", options.user], {
+        capture: true,
+      });
+      linuxSocketCredentials = includeAccountGroups(
+        originalCredentials,
+        parseNumericId(userId.stdout.trim()),
+        userGroups.map(({ id }) => id)
+      );
+      const fallbackGroup = await execCommand("id", ["-g", "nobody"], {
+        capture: true,
+        ignoreFailure: true,
+      });
+      if (fallbackGroup.code !== 0) {
+        throw new Error("Linux drop-sudo requires an unprivileged nobody account.");
+      }
+      const fallbackGroupId = parseNumericId(fallbackGroup.stdout.trim());
+      if (fallbackGroupId === 0) {
+        throw new Error("Linux drop-sudo requires a non-root nobody primary group.");
+      }
+      linuxSocketCredentials.fallbackGroupId = fallbackGroupId;
+      try {
+        await execCommand("/usr/bin/setfacl", ["--version"], { capture: true });
+      } catch {
+        throw new Error("Linux drop-sudo requires /usr/bin/setfacl (the acl package).");
+      }
+      const groupsById = new Map(userGroups.map((group) => [group.id, group]));
+      const serviceSockets = await findRootServiceSockets(
+        LINUX_RUNTIME_DIRECTORY,
+        linuxSocketCredentials,
+        true
+      );
+      const groups = new Set([options.group]);
+      for (const socket of serviceSockets) {
+        const group = groupsById.get(socket.groupId);
+        if (group && !group.primary) {
+          groups.add(group.name);
+        }
+      }
+      for (const group of groups) {
+        if (await removeUserFromLinuxGroup(options.user, group)) {
+          changed = true;
+        }
+      }
+      for (const socket of serviceSockets) {
+        if (await restrictRootServiceSocket(socket, linuxSocketCredentials)) {
+          changed = true;
+        }
       }
       break;
     }
@@ -158,6 +237,319 @@ async function dropSudoWithPrivileges(options: DropSudoOptions): Promise<void> {
   console.log(
     `Groups for ${options.user} after cleanup: ${groupsAfter.stdout.trim()}`
   );
+
+  if (linuxSocketCredentials) {
+    await verifyPrivilegedSocketsRestricted(linuxSocketCredentials);
+  }
+}
+
+async function removeUserFromLinuxGroup(
+  user: string,
+  group: string
+): Promise<boolean> {
+  if (!(await isUserInGroup(user, group))) {
+    console.log(`${user} is not a member of the ${group} group.`);
+    return false;
+  }
+
+  if (await commandExists("deluser")) {
+    await execCommand("deluser", [user, group]);
+    console.log(`Used 'deluser ${user} ${group}' to drop group access.`);
+  } else if (await commandExists("gpasswd")) {
+    await execCommand("gpasswd", ["-d", user, group]);
+    console.log(`Used 'gpasswd -d ${user} ${group}' to drop group access.`);
+  } else {
+    throw new Error("Neither deluser nor gpasswd available.");
+  }
+
+  return true;
+}
+
+async function getLinuxGroups(user: string): Promise<Array<LinuxGroup>> {
+  const [idsResult, namesResult, primaryResult] = await Promise.all([
+    execCommand("id", ["-G", user], { capture: true }),
+    execCommand("id", ["-Gn", user], { capture: true }),
+    execCommand("id", ["-g", user], { capture: true }),
+  ]);
+  const ids = splitFields(idsResult.stdout).map(parseNumericId);
+  const names = splitFields(namesResult.stdout);
+  const primaryId = parseNumericId(primaryResult.stdout.trim());
+
+  if (ids.length !== names.length) {
+    throw new Error(`Could not resolve group names for ${user}.`);
+  }
+
+  return ids.map((id, index) => ({
+    id,
+    name: names[index],
+    primary: id === primaryId,
+  }));
+}
+
+function splitFields(value: string): Array<string> {
+  return value
+    .trim()
+    .split(/\s+/)
+    .filter((field) => field.length > 0);
+}
+
+function parseNumericId(value: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`Invalid numeric ID: ${value}`);
+  }
+  return Number.parseInt(value, 10);
+}
+
+async function findRootServiceSockets(
+  directory: string,
+  credentials?: LinuxSocketCredentials,
+  includeWorldWritable = false,
+  displayDirectory = directory
+): Promise<Array<RootServiceSocket>> {
+  let directoryHandle;
+  try {
+    directoryHandle = await fs.open(
+      directory,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW
+    );
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (
+      code === "ENOENT" ||
+      (!credentials && (code === "EACCES" || code === "EPERM"))
+    ) {
+      return [];
+    }
+    throw error;
+  }
+
+  try {
+    const directoryDescriptorPath = `/proc/self/fd/${directoryHandle.fd}`;
+    const entries = await fs.readdir(directoryDescriptorPath, {
+      withFileTypes: true,
+    });
+    const sockets: Array<RootServiceSocket> = [];
+
+    for (const entry of entries) {
+      const entryPath = path.join(directoryDescriptorPath, entry.name);
+      const displayPath = path.join(displayDirectory, entry.name);
+      if (entry.isDirectory()) {
+        sockets.push(
+          ...(await findRootServiceSockets(
+            entryPath,
+            credentials,
+            includeWorldWritable,
+            displayPath
+          ))
+        );
+        continue;
+      }
+      if (!entry.isSocket()) {
+        continue;
+      }
+
+      let stats;
+      try {
+        stats = await fs.lstat(entryPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          continue;
+        }
+        throw error;
+      }
+
+      if (
+        stats.isSocket() &&
+        stats.uid === 0 &&
+        // Extra groups can shadow other-write with a denying group entry.
+        // Restrict all world-writable sockets before removing account groups;
+        // verification below always checks the runner's effective access.
+        ((includeWorldWritable && (stats.mode & 0o002) !== 0) ||
+          (await canWriteRootServiceSocket(entryPath, stats, credentials)))
+      ) {
+        if (includeWorldWritable) {
+          assertSocketAclCanDenyRunner(stats.mode, displayPath);
+        }
+        sockets.push({
+          path: displayPath,
+          groupId: stats.gid,
+          device: stats.dev,
+          inode: stats.ino,
+        });
+      }
+    }
+
+    return sockets;
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+async function canWriteRootServiceSocket(
+  socketPath: string,
+  expectedStats: Awaited<ReturnType<typeof fs.lstat>>,
+  credentials?: LinuxSocketCredentials
+): Promise<boolean> {
+  let socketHandle;
+  try {
+    socketHandle = await fs.open(
+      socketPath,
+      LINUX_O_PATH | fsConstants.O_NOFOLLOW
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+  try {
+    const stats = await socketHandle.stat();
+    if (
+      !stats.isSocket() ||
+      stats.uid !== 0 ||
+      stats.dev !== expectedStats.dev ||
+      stats.ino !== expectedStats.ino
+    ) {
+      throw new Error(`A privileged service socket changed during discovery.`);
+    }
+
+    return await isSocketWritable(socketHandle.fd, credentials);
+  } finally {
+    await socketHandle.close();
+  }
+}
+
+async function isSocketWritable(
+  fileDescriptor: number,
+  credentials?: LinuxSocketCredentials
+): Promise<boolean> {
+  if (!credentials) {
+    try {
+      await fs.access(`/proc/self/fd/${fileDescriptor}`, fsConstants.W_OK);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EACCES" || code === "EPERM" || code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  const identityGroups = [
+    {
+      primaryGroupId: credentials.primaryGroupId,
+      supplementaryGroupIds: credentials.supplementaryGroupIds,
+    },
+    ...(credentials.fallbackGroupId === undefined
+      ? []
+      : [
+          {
+            primaryGroupId: credentials.fallbackGroupId,
+            supplementaryGroupIds: [],
+          },
+        ]),
+  ];
+
+  for (const identity of identityGroups) {
+    const groupArgument =
+      identity.supplementaryGroupIds.length === 0
+        ? "--clear-groups"
+        : `--groups=${identity.supplementaryGroupIds.join(",")}`;
+    const result = await execCommand(
+      "/usr/bin/setpriv",
+      [
+        `--reuid=${credentials.userId}`,
+        `--regid=${identity.primaryGroupId}`,
+        groupArgument,
+        "--",
+        "/usr/bin/test",
+        "-w",
+        "/proc/self/fd/3",
+      ],
+      {
+        capture: true,
+        ignoreFailure: true,
+        inheritedFileDescriptor: fileDescriptor,
+      }
+    );
+    if (result.code === 0) {
+      return true;
+    }
+    if (result.code !== 1 || result.stderr.trim().length > 0) {
+      throw new Error(`Could not verify access to a privileged service socket.`);
+    }
+  }
+
+  return false;
+}
+
+function assertSocketAclCanDenyRunner(mode: number, socketPath: string): void {
+  // Linux may skip named ACL entries when all group/mask bits are zero.
+  // Raising the mask could activate unrelated grants, so reject this shape.
+  if ((mode & 0o070) === 0 && (mode & 0o002) !== 0) {
+    throw new Error(
+      `Cannot restrict ${socketPath} with an empty ACL mask while preserving other users' access.`
+    );
+  }
+}
+
+async function restrictRootServiceSocket(
+  socket: RootServiceSocket,
+  credentials: LinuxSocketCredentials
+): Promise<boolean> {
+  let socketHandle;
+  try {
+    socketHandle = await fs.open(
+      socket.path,
+      LINUX_O_PATH | fsConstants.O_NOFOLLOW
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+
+  try {
+    const stats = await socketHandle.stat();
+    if (!stats.isSocket()) {
+      throw new Error(`Expected ${socket.path} to be a socket.`);
+    }
+    if (stats.uid !== 0) {
+      throw new Error(`Expected ${socket.path} to be owned by root.`);
+    }
+    if (stats.dev !== socket.device || stats.ino !== socket.inode) {
+      throw new Error(`${socket.path} changed while dropping privileges.`);
+    }
+    assertSocketAclCanDenyRunner(stats.mode, socket.path);
+    // A named user entry takes precedence over group and other entries. Keep
+    // the existing mask so access for unrelated system services is unchanged.
+    await execCommand(
+      "/usr/bin/setfacl",
+      ["-n", "-m", `u:${credentials.userId}:---`, "--", "/proc/self/fd/3"],
+      { capture: true, inheritedFileDescriptor: socketHandle.fd }
+    );
+    if (await isSocketWritable(socketHandle.fd, credentials)) {
+      throw new Error(`Could not restrict access to ${socket.path}.`);
+    }
+    console.log(`Restricted access to ${socket.path} for runner UID ${credentials.userId}.`);
+    return true;
+  } finally {
+    await socketHandle.close();
+  }
+}
+
+async function verifyPrivilegedSocketsRestricted(
+  credentials?: LinuxSocketCredentials
+): Promise<void> {
+  const sockets = await findRootServiceSockets(
+    LINUX_RUNTIME_DIRECTORY,
+    credentials
+  );
+  if (sockets.length > 0) {
+    throw new Error(`drop-sudo did not revoke access to ${sockets[0].path}.`);
+  }
 }
 
 async function ensurePasswordlessSudo(): Promise<void> {
@@ -293,7 +685,11 @@ async function execCommand(
 ): Promise<ExecResult> {
   const capture = options.capture ?? false;
   const child = spawn(command, args, {
-    stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
+    stdio: capture
+      ? options.inheritedFileDescriptor === undefined
+        ? ["ignore", "pipe", "pipe"]
+        : ["ignore", "pipe", "pipe", options.inheritedFileDescriptor]
+      : "inherit",
   });
 
   let stdout = "";
